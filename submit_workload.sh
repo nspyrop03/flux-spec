@@ -45,7 +45,7 @@ module load Python/3.13.5
 FLURM_DIR="$PROJECT_seanergys/$USER/flurm"
 HOME_FLURM_DIR="$HOME/flurm"
 
-SPEC_CFG="$PROJECT_seanergys/$USER/flux_spec_gcc.cfg"
+SPEC_CFG="$FLUX_SPEC_DIR/config-spec/flux_spec_gcc.cfg"
 SPEC_ROOT="$PROJECT_seanergys/triantafyllis1/spechpc"
 export SPECHPC_BINARY_ROOT="$SPEC_ROOT"
 
@@ -54,35 +54,36 @@ export OMP_NUM_THREADS=1
 
 source "$PROJECT_seanergys/spyropoulos1/flurm/load-custom-runtime.sh"
 source "$PROJECT_seanergys/spyropoulos1/flurm/load-pmix-runtime.sh"
-export SPECHPC_FLUX_PMI=pmix
 
 pushd "$SPEC_ROOT" >/dev/null
 source ./shrc
 popd >/dev/null
 
 export LD_LIBRARY_PATH="$SPEC_ROOT/compat/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-ldd "$SPEC_ROOT/benchspec/HPC/519.clvleaf_t/exe/clvleaf_base.gnu_mpi" \
-    | grep -E 'libmpi|libpciaccess|libcudart|not found'
-
 export PATH="$FLUX_SPEC_DIR:$PATH"
-test -x "$FLUX_SPEC_DIR/spec-flux-submit"
+
+test -r "$FLUX_SPEC_DIR/run_spec_row.sh"
 command -v flux
 command -v runhpc
-command -v specinvoke
 flux version
 
-ls -l "$SPEC_ROOT/compat/lib/libnsl.so.1"
-ldd "$SPEC_ROOT/bin/specperl" | grep -E 'libnsl|not found'
-"$SPEC_ROOT/bin/specperl" -e 'print "specperl works\n"'
-
 python3 "$FLUX_SPEC_DIR/edit_flux_config.py" \
-    "$FLUX_SPEC_DIR/config/flux-config-cosched.toml" \
+    "$FLUX_SPEC_DIR/config-flux/flux-config-cosched.toml" \
     "$WORKLOAD_DIR" \
     "$@"
 
 host_lines="$(scontrol show hostnames "${SLURM_NODELIST:?}")"
 mapfile -t hosts <<< "$host_lines"
+
+if (( ${#hosts[@]} < 2 )); then
+    echo "Need at least two nodes: one control node and one compute node" >&2
+    exit 2
+fi
+
+export CONTROL_NODE="${hosts[0]}"
+printf 'Control node: %s\n' "$CONTROL_NODE"
+printf 'Compute node: %s\n' "${hosts[@]:1}"
+
 hostlist="$(IFS=,; echo "${hosts[*]}")"
 cores_per_node=$((2 * 4 * 2 * 8))
 
