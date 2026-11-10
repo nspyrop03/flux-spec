@@ -8,3 +8,8 @@
 sbatch flux-spec/submit_workload.sh flux-spec/test_input.csv
 ```
 
+# Usage
+```bash
+sbatch submit_workload.sh INPUT.csv [--compact] [--n_way N] [--resource_type TYPE] [--waste_threshold X]
+```
+

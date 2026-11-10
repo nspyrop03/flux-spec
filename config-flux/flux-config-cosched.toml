@@ -13,7 +13,7 @@ load-allowlist = "node,socket,numanode,core"
 match-format = "rv1"
 
 [coscheduling-cpu]
-allowed = true
+allowed = ALLOWED
 resource_type = RTYPE
 n_way = NWAY
 waste_threshold = WTHR

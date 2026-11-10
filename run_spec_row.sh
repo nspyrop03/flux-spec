@@ -29,6 +29,17 @@ for assignment in "$@"; do
     printf 'Row environment: %s=%q\n' "$name" "${!name}"
 done
 
+# Force a failure (if the flag is set to batch) to check if the watcher can catch it
+if [[ ${SPECHPC_TEST_FAILURE:-} == batch ]]; then
+    echo "Injected outer batch failure" >&2
+    exit 41
+fi
+
+printf 'nproc soft limit: %s\n' "$(ulimit -Su)"
+printf 'nproc hard limit: %s\n' "$(ulimit -Hu)"
+
+export SPECHPC_ROW_STATUS_FILE="$job_dir/exit_code"
+
 exec runhpc \
     --config="$config" \
     --action=validate \

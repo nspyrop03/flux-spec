@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import time
+import json
 from pathlib import Path
 
 def read_trace(path):
@@ -65,10 +66,15 @@ def read_trace(path):
     return header, rows
 
 def submit(batch_script, config, job_dir, app, procs, control_node, assignments):
+    test_options = []
+    if "SPECHPC_TEST_FAILURE=submit" in assignments:
+        test_options.append("--invalid-watcher-test-option")
     with (job_dir / "submit.err").open("wb") as err:
         result = subprocess.run(
             [
                 "flux", "batch",
+                *test_options,
+                "--conf=resource.norestrict=true",
                 "-n", str(procs),
                 "-c", "1",
                 f"--requires=-hosts:{control_node}",
@@ -101,9 +107,8 @@ def collect(job_id, job_dir):
             stdout=subprocess.DEVNULL,
             stderr=err,
         )
-        (job_dir / "exit_code").write_text(
-            f"{status.returncode}\n", encoding="utf-8"
-        )
+        with (job_dir / "exit_code").open("a", encoding="utf-8") as status_file:
+            status_file.write(f"batch={status.returncode}\n")
         ok = status.returncode == 0
 
         for key, filename in (
@@ -124,6 +129,53 @@ def collect(job_id, job_dir):
 
     return ok
 
+def check_jobs(pending):
+    result = subprocess.run(
+        ["flux", "jobs", "-a", "--count=0", "--json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # Replay assigns a unique job name to each row in this Flux instance.
+    jobs = {job["name"]: job for job in json.loads(result.stdout)["jobs"]}
+
+    for name, (job_id, job_dir, app) in list(pending.items()):
+        job = jobs.get(name, {})
+        batch_result = job.get("result")
+
+        status_file = job_dir / "exit_code"
+        try:
+            status_text = status_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            status_text = ""
+
+        mpi_statuses = [
+            int(code) for code in re.findall(r"^mpi=(\d+)\n", status_text, re.MULTILINE)
+        ]
+
+        for status in mpi_statuses:
+            if status != 0:
+                return f"{name} ({job_id}): flux run exited with status {status}"
+
+        if batch_result in {"FAILED", "TIMEOUT", "CANCELED"}:
+            note = job.get("exception", {}).get("note")
+            detail = f" ({note})" if note else ""
+            return f"{name} ({job_id}): batch {batch_result}{detail}"
+
+        if batch_result != "COMPLETED":
+            continue
+
+        if not mpi_statuses:
+            return f"{name} ({job_id}): batch completed without an MPI exit status"
+
+        with (job_dir / "stdout").open(encoding="utf-8", errors="replace") as stream:
+            if not any(line.strip() == f"Success: 1x{app}" for line in stream):
+                return f"{name} ({job_id}): SPEC success line missing"
+
+        del pending[name]
+
+    return None
+
 def main():
     if len(sys.argv) != 5:
         raise ValueError(
@@ -143,6 +195,11 @@ def main():
 
     header, rows = read_trace(input_csv)
     submitted = []
+    pending = {}
+    failure = None
+    watch_interval = float(os.environ.get("SPECHPC_WATCH_INTERVAL", "300"))
+    if not math.isfinite(watch_interval) or watch_interval <= 0:
+        raise ValueError("SPECHPC_WATCH_INTERVAL must be a positive number of seconds")
     failed = False
 
     with output_csv.open("x", encoding="utf-8", newline="") as stream:
@@ -157,26 +214,71 @@ def main():
             jobs.append((row, app, procs, offset, job_dir, assignments))
 
         start = time.monotonic()
-        for row, app, procs, offset, job_dir, assignments in jobs:
-            time.sleep(max(0.0, start + offset - time.monotonic()))
-            job_id = submit(
-                batch_script, config, job_dir, app, procs, control_node, assignments
+        next_check = start + watch_interval
+        rows_to_submit = iter(jobs)
+        next_row = next(rows_to_submit, None)
+
+        while next_row is not None or pending:
+            now = time.monotonic()
+
+            if pending and now >= next_check:
+                try:
+                    failure = check_jobs(pending)
+                except subprocess.CalledProcessError as exc:
+                    detail = (exc.stderr or "").strip()
+                    failure = f"Flux watcher query failed: {detail or exc.returncode}"
+                except (OSError, ValueError) as exc:
+                    failure = f"Watcher could not read job results: {exc}"
+
+                if failure:
+                    break
+
+                next_check = time.monotonic() + watch_interval
+
+            if next_row is not None:
+                row, app, procs, offset, job_dir, assignments = next_row
+                due = start + offset
+
+                if time.monotonic() >= due:
+                    job_id = submit(
+                        batch_script, config, job_dir, app, procs,
+                        control_node, assignments,
+                    )
+                    writer.writerow([*row, job_id])
+                    stream.flush()
+
+                    if not job_id:
+                        failure = f"{job_dir.name}: submission failed; see {job_dir / 'submit.err'}"
+                        break
+
+                    submitted.append((job_id, job_dir))
+                    pending[job_dir.name] = (job_id, job_dir, app)
+                    elapsed = time.monotonic() - start
+                    print(f"{job_dir.name} t={elapsed:.3f}s {job_id}", flush=True)
+
+                    next_row = next(rows_to_submit, None)
+                    if next_row is None:
+                        next_check = time.monotonic()
+                    continue
+
+                wake_at = min(due, next_check) if pending else due
+            elif pending:
+                wake_at = next_check
+            else:
+                break
+
+            time.sleep(max(0.0, wake_at - time.monotonic()))
+
+    if failure:
+        print(f"Aborting workload: {failure}", file=sys.stderr, flush=True)
+        job_ids = [job_id for job_id, _, _ in pending.values()]
+        if job_ids:
+            subprocess.run(
+                ["flux", "cancel", "--message=Workload watcher aborted replay", *job_ids],
+                check=False,
             )
 
-            writer.writerow([*row, job_id])
-            stream.flush()
-
-            if job_id:
-                submitted.append((job_id, job_dir))
-                elapsed = time.monotonic() - start
-                print(f"{job_dir.name} t={elapsed:.3f}s {job_id}", flush=True)
-            else:
-                failed = True
-                print(
-                    f"{job_dir.name}: no Flux job ID; see {job_dir / 'submit.err'}",
-                    file=sys.stderr,
-                )
-
+    failed = failure is not None
     for job_id, job_dir in submitted:
         if not collect(job_id, job_dir):
             failed = True

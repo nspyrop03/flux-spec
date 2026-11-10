@@ -18,7 +18,7 @@ ulimit -s unlimited
 ulimit -l unlimited
 
 if (( $# < 1 )); then
-    echo "Usage: sbatch submit_workload.sh INPUT.csv [--n_way N] [--resource_type TYPE] [--waste_threshold X]" >&2
+    echo "Usage: sbatch submit_workload.sh INPUT.csv [--compact] [--n_way N] [--resource_type TYPE] [--waste_threshold X]" >&2
     exit 2
 fi
 
