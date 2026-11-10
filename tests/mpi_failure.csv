@@ -1,0 +1,4 @@
+app,procs,submit_time,variables
+519.clvleaf_t,64,0,SPECHPC_SIZE=ref
+519.clvleaf_t,64,0,"SPECHPC_SIZE=test,SPECHPC_TEST_FAILURE=mpi"
+519.clvleaf_t,64,60,SPECHPC_SIZE=test

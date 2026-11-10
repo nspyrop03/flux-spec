@@ -1,0 +1,25 @@
+#!/bin/bash
+set -euo pipefail
+
+ranks=$1
+shift
+
+if [[ ${SPECHPC_TEST_FAILURE:-} == mpi ]]; then
+    set -- /bin/sh -c 'exit 42'
+fi
+
+status_file=${SPECHPC_ROW_STATUS_FILE:?Missing row status path}
+
+status=0
+flux run -n "$ranks" -c 1 -o pmi=pmix -o cpu-affinity=per-task -- "$@" || status=$?
+printf 'mpi=%d\n' "$status" >> "$status_file"
+
+if [[ ${SPECHPC_TEST_FAILURE:-} == validation && $status -eq 0 ]]; then
+    if [[ ! -f clover.out ]]; then
+        echo "Validation test: expected clover.out in $PWD" >&2
+        exit 43
+    fi
+    : > clover.out
+fi
+
+exit "$status"
