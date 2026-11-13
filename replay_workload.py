@@ -129,7 +129,7 @@ def collect(job_id, job_dir):
 
     return ok
 
-def check_jobs(pending):
+def check_jobs(pending, collected):
     result = subprocess.run(
         ["flux", "jobs", "-a", "--count=0", "--json"],
         check=True,
@@ -138,6 +138,12 @@ def check_jobs(pending):
     )
     # Replay assigns a unique job name to each row in this Flux instance.
     jobs = {job["name"]: job for job in json.loads(result.stdout)["jobs"]}
+
+    terminal_results = {"COMPLETED", "FAILED", "TIMEOUT", "CANCELED"}
+    for name, (job_id, job_dir, _) in pending.items():
+        batch_result = jobs.get(name, {}).get("result")
+        if batch_result in terminal_results and job_id not in collected:
+            collected[job_id] = collect(job_id, job_dir)
 
     for name, (job_id, job_dir, app) in list(pending.items()):
         job = jobs.get(name, {})
@@ -196,12 +202,12 @@ def main():
     header, rows = read_trace(input_csv)
     submitted = []
     pending = {}
+    collected = {}
     failure = None
     watch_interval = float(os.environ.get("SPECHPC_WATCH_INTERVAL", "300"))
     if not math.isfinite(watch_interval) or watch_interval <= 0:
         raise ValueError("SPECHPC_WATCH_INTERVAL must be a positive number of seconds")
-    failed = False
-
+    
     with output_csv.open("x", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow([*header, "flux_job_id"])
@@ -223,7 +229,7 @@ def main():
 
             if pending and now >= next_check:
                 try:
-                    failure = check_jobs(pending)
+                    failure = check_jobs(pending, collected)
                 except subprocess.CalledProcessError as exc:
                     detail = (exc.stderr or "").strip()
                     failure = f"Flux watcher query failed: {detail or exc.returncode}"
@@ -271,7 +277,10 @@ def main():
 
     if failure:
         print(f"Aborting workload: {failure}", file=sys.stderr, flush=True)
-        job_ids = [job_id for job_id, _, _ in pending.values()]
+        job_ids = [
+            job_id for job_id, _, _ in pending.values()
+            if job_id not in collected
+        ]
         if job_ids:
             subprocess.run(
                 ["flux", "cancel", "--message=Workload watcher aborted replay", *job_ids],
@@ -280,10 +289,10 @@ def main():
 
     failed = failure is not None
     for job_id, job_dir in submitted:
-        if not collect(job_id, job_dir):
-            failed = True
+        if job_id not in collected:
+            collected[job_id] = collect(job_id, job_dir)
 
-    return int(failed)
+    return int(failure is not None or not all(collected.values()))
 
 
 if __name__ == "__main__":

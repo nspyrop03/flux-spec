@@ -1,0 +1,9 @@
+app,procs,submit_time,variables
+619.clvleaf_s,256,0,
+632.sph_exa_s,256,0,OMPI_MCA_topo=basic
+613.soma_s,256,0,
+621.miniswp_s,256,0,
+634.hpgmgfv_s,256,0,
+618.tealeaf_s,256,0,
+628.pot3d_s,256,0,
+635.weather_s,256,0,
