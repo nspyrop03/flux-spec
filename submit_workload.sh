@@ -1,12 +1,17 @@
 #!/bin/bash -l
 
-#SBATCH --job-name=workload_type_A_1
+#SBATCH --job-name=test-workload
 #SBATCH --output=/p/home/jusers/%u/jusuf/flux-spec/runs/%x-%j.out
 #SBATCH --error=/p/home/jusers/%u/jusuf/flux-spec/runs/%x-%j.err
-#SBATCH --nodes=17
-#SBATCH --ntasks=2176
+# #SBATCH --nodes=17
+# #SBATCH --ntasks=2176
+
+#SBATCH --nodes=3
+#SBATCH --ntasks=384
+#SBATCH --time=00:30:00
+
 #SBATCH --threads-per-core=1
-#SBATCH --time=07:10:00
+# #SBATCH --time=07:10:00
 #SBATCH --partition=batch
 #SBATCH --account=seanergys
 #SBATCH --exclusive
@@ -37,7 +42,7 @@ module load Python/3.13.5
 : "${USER:?USER is not set}"
 
 FLUX_SPEC_DIR="$HOME/flux-spec"
-SHARED_FLURM_DIR="$PROJECT_seanergys/flurm"
+SHARED_FLURM_DIR="$PROJECT_seanergys/spyropoulos1/flurm"
 
 SPEC_CFG="$PROJECT_seanergys/spyropoulos1/spechpc-builds-gcc/flux_spec_gcc-build-905594.cfg"
 SPEC_ROOT="$PROJECT_seanergys/triantafyllis1/spechpc"
