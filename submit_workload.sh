@@ -1,17 +1,20 @@
 #!/bin/bash -l
 
-#SBATCH --job-name=test-workload
-#SBATCH --output=/p/home/jusers/%u/jusuf/flux-spec/runs/%x-%j.out
-#SBATCH --error=/p/home/jusers/%u/jusuf/flux-spec/runs/%x-%j.err
+# #SBATCH --job-name=workload_type_A
+#SBATCH --job-name=testing
+
+#SBATCH --output=/p/project1/seanergys/spyropoulos1/experiments/%x-%j.out
+#SBATCH --error=/p/project1/seanergys/spyropoulos1/experiments/%x-%j.err
+
 # #SBATCH --nodes=17
 # #SBATCH --ntasks=2176
+# #SBATCH --time=04:30:00
 
 #SBATCH --nodes=3
 #SBATCH --ntasks=384
-#SBATCH --time=00:30:00
+#SBATCH --time=00:10:00
 
 #SBATCH --threads-per-core=1
-# #SBATCH --time=07:10:00
 #SBATCH --partition=batch
 #SBATCH --account=seanergys
 #SBATCH --exclusive
@@ -30,6 +33,59 @@ fi
 INPUT_FILE="$(realpath -e -- "$1")"
 shift
 
+experiment_mode=false
+compact_mode=false
+n_way=""
+waste_threshold=""
+resource_type="numanode"
+extra_args=()
+
+while (( $# > 0 )); do
+    case "$1" in
+        --experiment)
+            experiment_mode=true
+            shift
+            ;;
+        --compact)
+            compact_mode=true
+            shift
+            ;;
+        --n_way)
+            if (( $# < 2 )); then
+                echo "Error: --n_way requires a value" >&2
+                exit 2
+            fi
+            n_way="$2"
+            shift 2
+            ;;
+        --waste_threshold)
+            if (( $# < 2 )); then
+                echo "Error: --waste_threshold requires a value" >&2
+                exit 2
+            fi
+            waste_threshold="$2"
+            shift 2
+            ;;
+        --resource_type)
+            if (( $# < 2 )); then
+                echo "Error: --resource_type requires a value" >&2
+                exit 2
+            fi
+            resource_type="$2"
+            shift 2
+            ;;
+        *)
+            extra_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ "$resource_type" != "numanode" && "$resource_type" != "ccx" ]]; then
+    echo "Error: --resource_type must be 'numanode' or 'ccx' (got '$resource_type')" >&2
+    exit 2
+fi
+
 module purge
 
 # Dependency hell resolved (I hope so)
@@ -43,6 +99,9 @@ module load Python/3.13.5
 
 FLUX_SPEC_DIR="$HOME/flux-spec"
 SHARED_FLURM_DIR="$PROJECT_seanergys/spyropoulos1/flurm"
+
+EXPERIMENTS_DIR="/p/project1/seanergys/$USER/experiments/$SLURM_JOB_ID"
+mkdir -p "$EXPERIMENTS_DIR"
 
 SPEC_CFG="$PROJECT_seanergys/spyropoulos1/spechpc-builds-gcc/flux_spec_gcc-build-905594.cfg"
 SPEC_ROOT="$PROJECT_seanergys/triantafyllis1/spechpc"
@@ -79,13 +138,33 @@ printf 'Control node: %s\n' "$CONTROL_NODE"
 printf 'Compute node: %s\n' "${hosts[@]:1}"
 
 hostlist="$(IFS=,; echo "${hosts[*]}")"
-cores_per_node=$((2 * 4 * 2 * 8))
+cores_per_node=$((2 * 4 * 16))
+
+build_common_variant_args() {
+    local -n out_args=$1
+
+    out_args=()
+    if [[ "$compact_mode" == true ]]; then
+        out_args+=(--compact)
+    fi
+    if [[ -n "$n_way" ]]; then
+        out_args+=(--n_way "$n_way")
+    fi
+    if [[ -n "$waste_threshold" ]]; then
+        out_args+=(--waste_threshold "$waste_threshold")
+    fi
+    if (( ${#extra_args[@]} > 0 )); then
+        out_args+=("${extra_args[@]}")
+    fi
+    out_args+=(--resource_type "numanode")
+}
 
 run_variant() {
     local suffix="$1"
     shift
-    local workload_dir="$FLUX_SPEC_DIR/workload_${SLURM_JOB_ID:?}${suffix}"
-    local output_file="$FLUX_SPEC_DIR/output_${SLURM_JOB_ID}${suffix}.csv"
+
+    local workload_dir="$EXPERIMENTS_DIR/workload_${SLURM_JOB_ID:?}${suffix}"
+    local output_file="$EXPERIMENTS_DIR/output_${SLURM_JOB_ID}${suffix}.csv"
 
     printf '\nStarting workload %s%s\n' "$SLURM_JOB_ID" "$suffix"
 
@@ -93,15 +172,32 @@ run_variant() {
         "$FLUX_SPEC_DIR/config-flux/flux-config-cosched.toml" \
         "$workload_dir" "$@" || return
 
-    # If we want a different resource_type co-scheduling, we may have to change the JGF graph given to flux
+    # Build JGF arguments based on resource_type
+    local jgf_args=(
+        --nodes "$hostlist"
+        --set socket=2
+    )
+
+    if [[ "$resource_type" == "ccx" ]]; then
+        jgf_args+=(
+            --set numanode=16
+            --set core=4
+        )
+    else
+        jgf_args+=(
+            --set numanode=4
+            --set core=16
+        )
+    fi
+
     python3 "$SHARED_FLURM_DIR/jgf_gen.py" \
-        --nodes "$hostlist" \
-        --set socket=2 --set numanode=4 --set core=16 \
+        "${jgf_args[@]}" \
         -o "$workload_dir/aris.json" || return
 
     flux R encode -H "$hostlist" -c "0-$((cores_per_node - 1))" \
         > "$workload_dir/R" || return
 
+    unset SLURM_CPUS_PER_TASK SLURM_TRES_PER_TASK SRUN_CPUS_PER_TASK SRUN_EXACT
     srun -N "$SLURM_JOB_NUM_NODES" -n "$SLURM_JOB_NUM_NODES" \
         --mpi=pmi2 --cpu-bind=none --export=ALL \
         flux start -o --config-path="$workload_dir/flux-config-cosched.toml" \
@@ -109,22 +205,41 @@ run_variant() {
         "$INPUT_FILE" "$SPEC_CFG" "$workload_dir" "$output_file"
 }
 
-if [[ ${1:-} != --experiment ]]; then
-    run_variant "" "$@"
-    exit
-fi
-
-if (( $# != 1 )); then
-    echo "--experiment takes no additional scheduling flags" >&2
-    exit 2
+# Experiment modes take precedence over all other workload arguments
+if [[ "$experiment_mode" == false ]]; then
+    variant_args=()
+    build_common_variant_args variant_args
+    run_variant "" "${variant_args[@]}"
+    exit $?
 fi
 
 experiment_status=0
-run_variant "_compact" --compact || experiment_status=1
+echo "[DEBUG] Experiment mode enabled"
+echo "[DEBUG] Resource type (JGF graph): $resource_type"
 
-for n_way in 2 4 8; do
+extra_exp_args=()
+if [[ -n "$waste_threshold" ]]; then
+    extra_exp_args+=(--waste_threshold "$waste_threshold")
+fi
+if (( ${#extra_args[@]} > 0 )); then
+    extra_exp_args+=("${extra_args[@]}")
+fi
+
+# Compact experiment
+run_variant "_compact" \
+    --compact \
+    "${extra_exp_args[@]}" \
+    --resource_type "numanode" \
+    || experiment_status=1
+
+# N-way experiments
+for exp_n_way in 2 4 8; do
     sleep 30
-    run_variant "_nway${n_way}" --n_way "$n_way" --resource_type numanode \
+
+    run_variant "_nway${exp_n_way}" \
+        --n_way "$exp_n_way" \
+        "${extra_exp_args[@]}" \
+        --resource_type "numanode" \
         || experiment_status=1
 done
 

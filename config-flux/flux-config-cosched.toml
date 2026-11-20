@@ -9,7 +9,6 @@ scheduling = SCHEDULING
 disable = true
 
 [sched-fluxion-resource]
-load-allowlist = "node,socket,numanode,core"
 match-format = "rv1"
 
 [coscheduling-cpu]

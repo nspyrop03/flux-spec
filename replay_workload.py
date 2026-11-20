@@ -6,7 +6,11 @@ import subprocess
 import sys
 import time
 import json
+import shutil
+import tempfile
 from pathlib import Path
+
+OUTPUT_FIELDS = ("flux_job_id", "start_time", "end_time")
 
 def read_trace(path):
     with path.open(encoding="utf-8-sig", newline="") as stream:
@@ -16,8 +20,8 @@ def read_trace(path):
 
         if len(set(header)) != len(header) or not set(required) <= set(header):
             raise ValueError("CSV needs unique columns including app, procs, submit_time")
-        if "flux_job_id" in header:
-            raise ValueError("CSV already contains flux_job_id")
+        if reserved := set(header).intersection(OUTPUT_FIELDS):
+            raise ValueError(f"CSV contains output-only columns: {', '.join(sorted(reserved))}")
 
         app_col, procs_col, time_col = map(header.index, required)
         variables_col = header.index("variables") if "variables" in header else None
@@ -129,7 +133,7 @@ def collect(job_id, job_dir):
 
     return ok
 
-def check_jobs(pending, collected):
+def check_jobs(pending, collected, validated):
     result = subprocess.run(
         ["flux", "jobs", "-a", "--count=0", "--json"],
         check=True,
@@ -178,9 +182,43 @@ def check_jobs(pending, collected):
             if not any(line.strip() == f"Success: 1x{app}" for line in stream):
                 return f"{name} ({job_id}): SPEC success line missing"
 
+        validated.append((job_id, job_dir, app))
         del pending[name]
 
     return None
+
+def job_times(job_dir, replay_epoch):
+    times = {}
+    try:
+        stream = (job_dir / "eventlog.jsonl").open(encoding="utf-8")
+    except FileNotFoundError:
+        return "", ""
+
+    with stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if event["name"] in ("start", "finish"):
+                times[event["name"]] = f"{event['timestamp'] - replay_epoch:.3f}"
+    return times.get("start", ""), times.get("finish", "")
+
+def finalize_csv(output_csv, header, output_rows, replay_epoch):
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="", dir=output_csv.parent, delete=False
+    ) as stream:
+        temporary_csv = Path(stream.name)
+        try:
+            writer = csv.writer(stream)
+            writer.writerow([*header, *OUTPUT_FIELDS])
+            for row, job_dir in output_rows:
+                times = job_times(job_dir, replay_epoch) if job_dir is not None else ("", "")
+                writer.writerow([*row, *times])
+            stream.close()
+            temporary_csv.chmod(output_csv.stat().st_mode & 0o777)
+            temporary_csv.replace(output_csv)
+        finally:
+            temporary_csv.unlink(missing_ok=True)
 
 def main():
     if len(sys.argv) != 5:
@@ -200,9 +238,12 @@ def main():
         raise FileNotFoundError(f"Batch script missing: {batch_script}")
 
     header, rows = read_trace(input_csv)
+    submit_time_col = header.index("submit_time")
+    output_rows = []
     submitted = []
     pending = {}
     collected = {}
+    validated = []
     failure = None
     watch_interval = float(os.environ.get("SPECHPC_WATCH_INTERVAL", "300"))
     if not math.isfinite(watch_interval) or watch_interval <= 0:
@@ -210,7 +251,7 @@ def main():
     
     with output_csv.open("x", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow([*header, "flux_job_id"])
+        writer.writerow([*header, *OUTPUT_FIELDS])
         stream.flush()
 
         jobs = []
@@ -219,6 +260,7 @@ def main():
             job_dir.mkdir()
             jobs.append((row, app, procs, offset, job_dir, assignments))
 
+        replay_epoch = time.time()
         start = time.monotonic()
         next_check = start + watch_interval
         rows_to_submit = iter(jobs)
@@ -229,7 +271,7 @@ def main():
 
             if pending and now >= next_check:
                 try:
-                    failure = check_jobs(pending, collected)
+                    failure = check_jobs(pending, collected, validated)
                 except subprocess.CalledProcessError as exc:
                     detail = (exc.stderr or "").strip()
                     failure = f"Flux watcher query failed: {detail or exc.returncode}"
@@ -250,7 +292,11 @@ def main():
                         batch_script, config, job_dir, app, procs,
                         control_node, assignments,
                     )
-                    writer.writerow([*row, job_id])
+                    elapsed = f"{time.monotonic() - start:.3f}"
+                    output_row = [*row, job_id]
+                    output_row[submit_time_col] = elapsed if job_id else ""
+                    output_rows.append((output_row, job_dir if job_id else None))
+                    writer.writerow([*output_row, "", ""])
                     stream.flush()
 
                     if not job_id:
@@ -259,8 +305,7 @@ def main():
 
                     submitted.append((job_id, job_dir))
                     pending[job_dir.name] = (job_id, job_dir, app)
-                    elapsed = time.monotonic() - start
-                    print(f"{job_dir.name} t={elapsed:.3f}s {job_id}", flush=True)
+                    print(f"{job_dir.name} t={elapsed}s {job_id}", flush=True)
 
                     next_row = next(rows_to_submit, None)
                     if next_row is None:
@@ -291,6 +336,12 @@ def main():
     for job_id, job_dir in submitted:
         if job_id not in collected:
             collected[job_id] = collect(job_id, job_dir)
+
+    finalize_csv(output_csv, header, output_rows, replay_epoch)
+
+    for job_id, job_dir, app in validated:
+        if collected.get(job_id):
+            shutil.rmtree(job_dir / "spec" / "benchspec" / "HPC" / app / "run")
 
     return int(failure is not None or not all(collected.values()))
 
